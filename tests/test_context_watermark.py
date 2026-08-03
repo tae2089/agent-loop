@@ -315,6 +315,86 @@ class TestWatermark(WatermarkHarness):
         self.assertEqual(verdict["continue"], False)
         self.assertIn("Compaction is starting", verdict["stopReason"])
 
+    def test_t25_claude_precompact_blocks_with_claude_decision_contract(self):
+        # Claude Code cancels compaction on a top-level decision:block only;
+        # continue/stopReason alone lets auto compaction through.
+        self.write_transcript([assistant_usage(100_000)])
+
+        proc = self.run_hook(self.hook_input(
+            hook_event_name="PreCompact",
+            trigger="auto",
+        ))
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        verdict = json.loads(proc.stdout)
+        self.assertEqual(verdict["decision"], "block")
+        self.assertIn("handoff", verdict["reason"])
+
+
+class TestMidTurnWatermark(WatermarkHarness):
+    """Auto compaction fires mid-turn, so Stop is too late to be the only gate."""
+
+    def test_t26_midturn_above_threshold_blocks_before_auto_compaction(self):
+        self.write_transcript([assistant_usage(160_000)])  # 80%: under Stop's 0.9
+
+        proc = self.run_hook(
+            self.hook_input(hook_event_name="PostToolUse"),
+            extra_args=["--midturn-threshold", "0.75"],
+        )
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        verdict = json.loads(proc.stdout)
+        self.assertEqual(verdict["decision"], "block")
+        self.assertIn("handoff", verdict["reason"])
+        self.assertNotIn("continue", verdict)  # must not abort the turn
+
+    def test_t27_midturn_below_threshold_passes(self):
+        self.write_transcript([assistant_usage(100_000)])  # 50%
+
+        proc = self.run_hook(
+            self.hook_input(hook_event_name="PostToolUse"),
+            extra_args=["--midturn-threshold", "0.75"],
+        )
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "")
+
+    def test_t28_midturn_with_valid_handoff_passes(self):
+        handoff = self.dir / "handoff.md"
+        handoff.write_text(GOOD_HANDOFF, encoding="utf-8")
+        self.write_transcript([
+            user_text("handoff를 작성해"),
+            write_call(str(handoff)),
+            tool_result(),
+            assistant_usage(160_000),
+        ])
+
+        proc = self.run_hook(
+            self.hook_input(hook_event_name="PostToolUse"),
+            extra_args=["--midturn-threshold", "0.75"],
+        )
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "")
+
+    def test_t29_default_midturn_threshold_leaves_headroom_for_auto_compaction(self):
+        self.write_transcript([assistant_usage(156_000)])  # 78%
+
+        proc = self.run_hook(self.hook_input(hook_event_name="PostToolUse"))
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(json.loads(proc.stdout)["decision"], "block")
+
+    def test_t30_midturn_without_usage_data_passes(self):
+        self.write_transcript([
+            {"type": "user", "message": {"role": "user", "content": "계속"}},
+        ])
+
+        proc = self.run_hook(self.hook_input(hook_event_name="PostToolUse"))
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "")
+
 
 if __name__ == "__main__":
     unittest.main()

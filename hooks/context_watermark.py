@@ -40,6 +40,11 @@ DEFAULT_WINDOW = 200_000
 # Long-context recall degrades well before the window fills (Chroma "Context
 # Rot", 2025), so evacuate at 0.85 rather than waiting for a near-full window.
 DEFAULT_THRESHOLD = 0.85
+# Auto compaction fires mid-turn and resets usage before Stop runs, so Stop's
+# watermark can never see a full window in an auto-compacting session. Sample
+# mid-turn too, low enough to leave room to write the handoff first.
+DEFAULT_MIDTURN_THRESHOLD = 0.75
+MIDTURN_EVENTS = frozenset({"PostToolUse"})
 
 
 def _current_turn(entries: list[dict]) -> list[dict]:
@@ -87,31 +92,41 @@ def handoff_written(entries: list[dict], cwd: Path) -> tuple[Path | None, list[s
     return None, notes
 
 
-def run_hook(window: int, threshold: float) -> int:
+def run_hook(window: int, threshold: float, midturn_threshold: float) -> int:
     hook_input = read_hook_input(LABEL)
     if hook_input is None:
         return 0
-    return run_fail_open(LABEL, lambda: _run_hook(hook_input, window, threshold))
+    return run_fail_open(
+        LABEL, lambda: _run_hook(hook_input, window, threshold, midturn_threshold)
+    )
 
 
 def _print_block(hook_input: dict, reason: str) -> None:
-    """Continue a Stop turn, but stop compaction itself at PreCompact."""
-    # Stop's decision:block feeds reason back to both Claude and Codex. A
-    # PreCompact barrier must stop the lifecycle event instead.
+    """Continue a Stop/PostToolUse turn, but stop compaction itself at PreCompact."""
+    # decision:block feeds reason back to both Claude and Codex, and is the only
+    # shape Claude Code accepts to cancel compaction:
+    # https://code.claude.com/docs/en/hooks
+    # Codex instead stops the lifecycle event via continue/stopReason, so
+    # PreCompact carries both contracts.
     # https://learn.chatgpt.com/docs/hooks
+    verdict = {"decision": "block", "reason": reason}
     if hook_input.get("hook_event_name") == "PreCompact":
-        print(json.dumps({
+        verdict.update({
             "continue": False,
             "stopReason": reason,
             "systemMessage": reason,
-        }, ensure_ascii=False))
-        return
-    print(json.dumps({"decision": "block", "reason": reason}, ensure_ascii=False))
+        })
+    print(json.dumps(verdict, ensure_ascii=False))
 
 
-def _run_hook(hook_input: dict, window: int, threshold: float) -> int:
+def _run_hook(hook_input: dict, window: int, threshold: float,
+              midturn_threshold: float) -> int:
     entries = parse_transcript(Path(hook_input.get("transcript_path")))
-    compaction_due = hook_input.get("hook_event_name") == "PreCompact"
+    event = hook_input.get("hook_event_name")
+    compaction_due = event == "PreCompact"
+    midturn = event in MIDTURN_EVENTS
+    if midturn:
+        threshold = midturn_threshold
     tokens = context_tokens(entries)
     if tokens is None and not compaction_due:
         return 0
@@ -144,7 +159,9 @@ def _run_hook(hook_input: dict, window: int, threshold: float) -> int:
         "user corrections and value judgments (which work was deemed low-value, wasteful, or "
         "skippable — preserve these first and quote them verbatim rather than paraphrasing, "
         "they are the most expensive to rediscover and lose the most in summary), "
-        "verified state (tests/commands run), and exact next steps. Then finish the turn."
+        "verified state (tests/commands run), and exact next steps. "
+        + ("Write it now, before the context fills further, then carry on with the task."
+           if midturn else "Then finish the turn.")
     )
     _print_block(hook_input, reason)
     return 0
@@ -171,11 +188,13 @@ def main() -> int:
     parser.add_argument("--window", type=int, default=DEFAULT_WINDOW,
                         help="context window in tokens; used only when the transcript reports none")
     parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD, help="block threshold ratio")
+    parser.add_argument("--midturn-threshold", type=float, default=DEFAULT_MIDTURN_THRESHOLD,
+                        help=f"block threshold ratio for mid-turn events ({', '.join(sorted(MIDTURN_EVENTS))})")
     parser.add_argument("--check", metavar="TRANSCRIPT", help="report usage instead of running as a hook")
     args = parser.parse_args()
     if args.check:
         return run_check(args.window, args.check)
-    return run_hook(args.window, args.threshold)
+    return run_hook(args.window, args.threshold, args.midturn_threshold)
 
 
 if __name__ == "__main__":
